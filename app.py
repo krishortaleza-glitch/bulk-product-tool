@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
+from rapidfuzz import fuzz
 
 st.set_page_config(page_title="Bulk Product Request Tool", layout="wide")
 st.title("📦 Bulk Product Request Tool")
@@ -15,11 +16,26 @@ def clean_upc_series(series):
     series = series.str.replace(r"\D", "", regex=True)
     return series
 
+def clean_desc(series):
+    return series.astype(str).str.lower().str.strip()
+
 def generate_keys(df, col, prefix):
     s = clean_upc_series(df[col])
     df[f"{prefix}_12"] = s.str.zfill(12)
     df[f"{prefix}_stripped"] = df[f"{prefix}_12"].str.lstrip("0")
     df[f"{prefix}_11"] = df[f"{prefix}_12"].str[-11:]
+    df[f"{prefix}_10"] = df[f"{prefix}_12"].str[-10:]
+
+def combine_cols(*cols):
+    result = []
+    for values in zip(*cols):
+        vals = []
+        for v in values:
+            if isinstance(v, list):
+                vals.extend(v)
+        vals = list(set(vals))
+        result.append(vals if vals else None)
+    return result
 
 # ==============================
 # FILE UPLOAD
@@ -65,13 +81,15 @@ if adm_file and product_file and store_file:
         sf_family = st.selectbox("Family Column (Store File)", sf_df.columns)
 
     # ==============================
-    # PROCESS BUTTON
+    # PROCESS
     # ==============================
     if st.button("🚀 Process Files"):
 
         with st.spinner("Processing..."):
 
-            # KEYS
+            main_df["desc_clean"] = clean_desc(main_df[main_desc])
+            product_df["desc_clean"] = clean_desc(product_df[product_desc])
+
             generate_keys(main_df, main_upc, "m")
 
             product_df["UPC_list"] = product_df[[product_upc1, product_upc2]].values.tolist()
@@ -79,44 +97,77 @@ if adm_file and product_file and store_file:
 
             generate_keys(product_df, "UPC_list", "p")
 
-            # BUILD MAPS
+            # ==============================
+            # EXACT MATCH
+            # ==============================
             def build_map(df, key):
                 return df.groupby(key).agg({
                     product_uid: lambda x: list(set(x)),
                     product_family: lambda x: list(set(x))
-                }).rename(columns={
-                    product_uid: "uids",
-                    product_family: "families"
                 })
 
             map_12 = build_map(product_df, "p_12")
-            map_strip = build_map(product_df, "p_stripped")
-            map_11 = build_map(product_df, "p_11")
 
-            # MERGE
             merged = main_df.merge(map_12, how="left", left_on="m_12", right_index=True)
-            merged = merged.merge(map_strip, how="left", left_on="m_stripped", right_index=True, suffixes=("", "_s"))
-            merged = merged.merge(map_11, how="left", left_on="m_11", right_index=True, suffixes=("", "_11"))
 
-            def combine_cols(col1, col2, col3):
-                result = []
-                for a, b, c in zip(col1, col2, col3):
-                    vals = []
-                    for v in (a, b, c):
-                        if isinstance(v, list):
-                            vals.extend(v)
-                    vals = list(set(vals))
-                    result.append(vals if vals else None)
-                return result
+            merged["All Retail UIDs"] = merged[product_uid]
+            merged["All Families"] = merged[product_family]
 
-            merged["All Retail UIDs"] = combine_cols(
-                merged["uids"], merged["uids_s"], merged["uids_11"]
-            )
+            # ==============================
+            # 🔥 FUZZY 10-DIGIT MATCH
+            # ==============================
+            product_df["p_12_str"] = product_df["p_12"].astype(str)
 
-            merged["All Families"] = combine_cols(
-                merged["families"], merged["families_s"], merged["families_11"]
-            )
+            def fuzzy_match(row):
+                if isinstance(row["All Retail UIDs"], list):
+                    return row["All Retail UIDs"], row["All Families"], 100, "UPC Match"
 
+                upc10 = row["m_10"]
+                desc = row["desc_clean"]
+
+                candidates = product_df[
+                    product_df["p_12_str"].str.contains(upc10, na=False)
+                ]
+
+                best_score = 0
+                best_uid = None
+                best_family = None
+
+                all_uids = []
+                all_families = []
+
+                for _, r in candidates.iterrows():
+                    score = fuzz.partial_ratio(desc, r["desc_clean"])
+
+                    if score >= 70:
+                        all_uids.append(r[product_uid])
+                        all_families.append(r[product_family])
+
+                        if score > best_score:
+                            best_score = score
+                            best_uid = r[product_uid]
+                            best_family = r[product_family]
+
+                if not all_uids:
+                    return None, None, 0, "No Match"
+
+                return (
+                    list(set(all_uids)),
+                    list(set(all_families)),
+                    best_score,
+                    "10-digit Fuzzy Match"
+                )
+
+            results = merged.apply(fuzzy_match, axis=1)
+
+            merged["All Retail UIDs"] = results.apply(lambda x: x[0])
+            merged["All Families"] = results.apply(lambda x: x[1])
+            merged["Match Score"] = results.apply(lambda x: x[2])
+            merged["Match Type"] = results.apply(lambda x: x[3])
+
+            # ==============================
+            # FINALIZE
+            # ==============================
             merged["Retail UID"] = merged["All Retail UIDs"].apply(
                 lambda x: x[0] if isinstance(x, list) else None
             )
@@ -129,10 +180,6 @@ if adm_file and product_file and store_file:
                 lambda x: len(x) > 1 if isinstance(x, list) else False
             )
 
-            merged["Match Type"] = merged["Retail UID"].apply(
-                lambda x: "UPC Match" if pd.notna(x) else "No Match"
-            )
-
             merged["All Retail UIDs"] = merged["All Retail UIDs"].apply(
                 lambda x: ", ".join(map(str, x)) if isinstance(x, list) else None
             )
@@ -141,7 +188,9 @@ if adm_file and product_file and store_file:
                 lambda x: ", ".join(map(str, x)) if isinstance(x, list) else None
             )
 
+            # ==============================
             # STORE VALIDATION
+            # ==============================
             merged["store_family_key"] = (
                 merged[main_store].astype(str) + "|" + merged["Family"].astype(str)
             )
@@ -153,53 +202,13 @@ if adm_file and product_file and store_file:
             valid_keys = set(sf_df["store_family_key"])
             merged["Valid Store-Family"] = merged["store_family_key"].isin(valid_keys)
 
-            # OUTPUTS
-            good_df = merged[
-                (merged["Retail UID"].notna()) &
-                (merged["Valid Store-Family"])
-            ][[main_store, "Retail UID"]].drop_duplicates()
-
-            good_df.columns = ["Store", "Retail UID"]
-
-            invalid_df = merged[
-                (merged["Retail UID"].isna()) |
-                (~merged["Valid Store-Family"])
-            ].copy()
-
-            invalid_df["Reason"] = invalid_df.apply(
-                lambda r: "No Match" if pd.isna(r["Retail UID"])
-                else "Invalid Store-Family" if not r["Valid Store-Family"]
-                else "Multiple Matches" if r["Multiple Matches"]
-                else "",
-                axis=1
-            )
-
-            invalid_df = invalid_df[[main_store, main_upc, main_desc, "Reason"]]
-            invalid_df.columns = ["Store", "UPC", "Description", "Reason"]
-
-            unmatched_df = merged[merged["Match Type"] == "No Match"][
-                [main_upc, main_desc]
-            ]
-            unmatched_df.columns = ["UPC", "Description"]
-
-            invalid_sf_df = merged[~merged["Valid Store-Family"]][
-                [main_store, "Family"]
-            ].drop_duplicates()
-            invalid_sf_df.columns = ["Store", "Family"]
-
-            summary = merged["Match Type"].value_counts().reset_index()
-            summary.columns = ["Match Type", "Count"]
-
+            # ==============================
             # EXPORT
+            # ==============================
             output = BytesIO()
 
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 merged.to_excel(writer, sheet_name="Full Output", index=False)
-                summary.to_excel(writer, sheet_name="Summary", index=False)
-                good_df.to_excel(writer, sheet_name="Good To Go", index=False)
-                invalid_df.to_excel(writer, sheet_name="Invalid For Portal", index=False)
-                unmatched_df.to_excel(writer, sheet_name="Unmatched Products", index=False)
-                invalid_sf_df.to_excel(writer, sheet_name="Invalid Store Family", index=False)
 
             output.seek(0)
 
